@@ -1,0 +1,112 @@
+import machine
+import os
+import time
+from machine import I2S, Pin, I2C
+import ssd1306
+
+# --- 1. CONFIGURATION & PIN MAPPING ---
+# Display: I2C0 on GP16 (SDA) and GP17 (SCL)
+i2c = I2C(0, scl=Pin(17), sda=Pin(16))
+oled = ssd1306.SSD1306_I2C(128, 32, i2c)
+
+# Buttons: Internal pull-up (Active Low)
+# Wiring: Pin -> Button -> GND
+btn_fwd  = Pin(10, Pin.IN, Pin.PULL_UP)
+btn_back = Pin(11, Pin.IN, Pin.PULL_UP)
+btn_pp   = Pin(12, Pin.IN, Pin.PULL_UP)
+
+# I2S Audio: SCK=18, WS=19, SD=20
+audio_out = I2S(0, 
+                sck=Pin(18), 
+                ws=Pin(19), 
+                sd=Pin(20), 
+                mode=I2S.TX, 
+                bits=16, 
+                format=I2S.STEREO, 
+                rate=44100, 
+                ibuf=20480) # Increased buffer for smooth BT streaming
+
+# --- 2. CORE FUNCTIONS ---
+def get_songs():
+    """Scans for WAV files in the /songs directory."""
+    try:
+        # If using USB OTG, change '/songs' to '/usb'
+        files = [f for f in os.listdir('/songs') if f.endswith('.wav')]
+        return sorted(files)
+    except:
+        return []
+
+def update_ui(status, track, bt_icon=True):
+    """Refreshes the 0.91" OLED display."""
+    oled.fill(0)
+    oled.text("VIPER-OS", 35, 0)
+    if bt_icon:
+        oled.text("BT", 110, 0)
+    
+    # Visual divider
+    oled.hline(0, 10, 128, 1)
+    
+    # Status and Track Info
+    oled.text(f"> {status}", 0, 14)
+    # Truncate long track names to prevent overflow
+    display_name = track[:15] if len(track) > 15 else track
+    oled.text(display_name, 0, 24)
+    oled.show()
+
+# --- 3. SYSTEM INITIALIZATION ---
+playlist = get_songs()
+current_idx = 0
+playing = False
+
+if not playlist:
+    update_ui("ERROR", "No Songs Found", False)
+    while True: pass # Halt if no music
+
+update_ui("READY", playlist[current_idx])
+
+# --- 4. MAIN PLAYBACK ENGINE ---
+while True:
+    # Handle Play/Pause Button
+    if not btn_pp.value():
+        playing = not playing
+        update_ui("PLAYING" if playing else "PAUSED", playlist[current_idx])
+        time.sleep(0.4) # Debounce
+
+    # Handle Forward Button
+    if not btn_fwd.value():
+        playing = True
+        current_idx = (current_idx + 1) % len(playlist)
+        update_ui("NEXT >>", playlist[current_idx])
+        time.sleep(0.4)
+        continue # Restart song logic
+
+    # Handle Backward Button
+    if not btn_back.value():
+        playing = True
+        current_idx = (current_idx - 1) % len(playlist)
+        update_ui("<< BACK", playlist[current_idx])
+        time.sleep(0.4)
+        continue
+
+    # Playback Stream
+    if playing:
+        try:
+            with open(f"/songs/{playlist[current_idx]}", "rb") as f:
+                f.seek(44) # Skip 44-byte WAV header
+                while playing:
+                    # Check buttons during stream
+                    if not btn_pp.value() or not btn_fwd.value() or not btn_back.value():
+                        break
+                    
+                    data = f.read(4096)
+                    if not data: # End of file
+                        current_idx = (current_idx + 1) % len(playlist)
+                        update_ui("AUTO-NEXT", playlist[current_idx])
+                        break
+                    
+                    audio_out.write(data)
+        except Exception as e:
+            update_ui("FILE ERR", str(e))
+            playing = False
+
+    time.sleep(0.01) # Small CPU rest
